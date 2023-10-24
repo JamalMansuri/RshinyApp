@@ -1,0 +1,242 @@
+#PLACEHOLDER Data Processor Tool w/ Interface_V3
+#Jamal Mansuri 9/7/2023
+
+#If packages are not installed, install separately, see confluence page on how to guide
+#NOTE: You do not need to close the application to refresh, there is a refresh button ontop!
+#NOTE: You can just click Run App ontop for the application, no need to Ctrl + Enter!
+
+#Must load libraries if its a new session
+library(shiny)
+library(readxl)
+library(tidyverse)
+
+#Click on line on line 15, preceding the #. Ctrl + Enter x 3 Times
+#-----------UI-----------#
+ui <- fluidPage(
+  titlePanel("PLACEHOLDER Data Processor V2 09/05/2023_JM"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      fileInput('platelayout', 'Upload Plate Layout(.xslv) *MUST USE PROVIDED TEMPLATE*'),
+      fileInput('PLACEHOLDERdata', 'Choose PLACEHOLDER Data(.csv)'),
+      actionButton("plotData", "Generate Plots & Data"),
+      downloadButton('downloadData1', 'Download Combined Data'),
+      downloadButton('downloadData2', 'Download Summarized Data')
+    ),
+    
+    mainPanel(
+      tabsetPanel(type = "tabs",
+                  tabPanel("Linear Regression Plots", plotOutput("regressionPlots")),
+                  tabPanel("Bar Chart", plotOutput("barChart")),
+      )
+    )
+  )
+)
+
+#--------------Server Internals----------------------#
+
+server <- function(input, output) {
+  
+  #Defining df_downloads as reactive
+  df_combined_reactive <- reactiveVal()
+  df_combined_summarized_reactive <- reactiveVal()
+  
+  #Ingestion of data from upload
+  observeEvent(input$plotData, {
+    inFile1 <- input$platelayout
+    inFile2 <- input$PLACEHOLDERdata
+    
+    if (is.null(inFile1) || is.null(inFile2)) {
+      return(NULL)
+    }
+    
+#------------Data Ingestion, Array Conversion & Combination---------------#  
+    #Plate layout Data Conversion
+    
+      df_platelayout <- read_excel(inFile1$datapath, col_names = FALSE)
+    
+      #Define the transposed 96-well Matrix and convert into a vector
+      Target_Name <- as.vector(t(df_platelayout[2:9,1:12]))
+      SampleName_Concentration <- as.vector(t(df_platelayout[11:18,1:12]))
+      Sample_Type <- as.vector(t(df_platelayout[20:27,1:12]))
+      Well_ID <- as.vector(t(df_platelayout[29:36,1:12]))
+      
+      #Create dataframe with vectors
+      df_plate <- data.frame(Target_Name,SampleName_Concentration,Sample_Type,
+                             Well_ID)
+      
+    #PLACEHOLDER Data Conversion
+      df_PLACEHOLDERdata <- read.csv(inFile2$datapath, header = FALSE)
+      
+      #Define the transposed 96-well Matrix and convert into a vector
+      Average <- as.vector(t(df_PLACEHOLDERdata[602:609,1:12]))
+      St_dev <- as.vector(t(df_PLACEHOLDERdata[612:619,1:12]))
+      CoVar <- as.vector(t(df_PLACEHOLDERdata[622:629,1:12]))
+      
+      #Create dataframe with vectors
+      df_PLACEHOLDER <- data.frame(Average, St_dev, CoVar)
+     
+      
+    #Combine platelayout and PLACEHOLDER dataframes
+      df_combined <- cbind(df_plate, df_PLACEHOLDER)
+      
+    
+
+  #--------------------Linear Regression----------------------#
+      
+    #Filter df_combined - Standards and assign double type to columns 2 & 5:7
+      df_standards <- df_combined %>% filter(str_detect(df_combined$Sample_Type, "Standard|Blank"))
+      df_standards <- as.data.frame(df_standards)
+      df_standards <- df_standards %>% mutate_at(vars(2,5:7), as.double)
+      
+    #Summarize data frame by Target Name & Sample Conc. by piping the data through the groups. 
+      df_standards_summarized <- df_standards %>%
+        group_by(Target_Name, SampleName_Concentration) %>% 
+        summarise(
+          mean_Ampere = mean(Average, na.rm = TRUE),
+          st_dev_Ampere = sd(St_dev, na.rm = TRUE),
+          CoV_Average = st_dev_Ampere / mean_Ampere * 100,
+          .groups = "drop"
+        )
+      
+      #Split df by target name
+      df_standards_split <- split(df_standards_summarized, df_standards_summarized$Target_Name)
+        
+      #Skippy if function if no values:
+      if (nrow(na.omit(df_standards_summarized)) > 1) {
+      
+        # Linear model for regression
+        lm_model <- lm(mean_Ampere ~ SampleName_Concentration, data = df_standards_summarized)
+        
+        # Extract R^2 value
+        r2 <- summary(lm_model)$r.squared
+        
+        
+        output$regressionPlots <- renderPlot({
+          # Linear model for regression across all targets
+          lm_models <- lapply(unique(df_standards_summarized$Target_Name), function(target) {
+            df_target <- filter(df_standards_summarized, Target_Name == target)
+            lm(mean_Ampere ~ SampleName_Concentration, data = df_target)
+          })
+          
+          r2_values <- sapply(lm_models, function(model) summary(model)$r.squared)
+          names(r2_values) <- unique(df_standards_summarized$Target_Name)
+          
+          # Adjust Target_Name to include R^2 value
+          df_standards_summarized$Target_Name <- factor(paste0(df_standards_summarized$Target_Name, 
+                                                               " (R^2 = ", round(r2_values[df_standards_summarized$Target_Name], 3), ")"))
+          
+          #Plotting the linear graph
+          plot <- ggplot(df_standards_summarized, aes(x = SampleName_Concentration, y = mean_Ampere)) +
+            geom_point(aes(color = factor(SampleName_Concentration)), size = 4, alpha = 10, shape = 18) + 
+            geom_smooth(method = "lm", se = FALSE, color = "gray", linetype = "dashed") +
+            annotate("text", x = max(df_standards_summarized$SampleName_Concentration) * 0.7, y = min(df_standards_summarized$mean_Ampere), 
+                     label = "") +
+            labs(title = "Figure 1. Linear Regression for each mutation",
+                 x = "Concentration (pM)", y = "Mean Ampere", fill = "Conc. (pM)") +
+            geom_errorbar(aes(ymin = mean_Ampere - st_dev_Ampere, 
+                              ymax = mean_Ampere + st_dev_Ampere), width = 0.2) +
+            scale_y_reverse() +
+            facet_grid(~Target_Name, scales = "free", space = "free") +
+            theme(legend.title = element_blank(), 
+                  axis.text = element_text(size = 14, colour = "black"), 
+                  strip.text = element_text(size = 14, face = "bold"),
+                  axis.title.x = element_text(size = 16, face = "bold"),  
+                  axis.title.y = element_text(size = 16, face = "bold")
+            )
+          
+          print(plot)
+        }, height = 800)
+      }
+      
+#---------------Bar Chart----------------------#     
+    
+      #Processes data
+        df_combined <- df_combined %>% mutate_at(vars(5:7), as.double)
+        
+        #Filter df by sample and blanks
+        df_combined_filtered <- df_combined %>% 
+          filter(grepl("Sample|Blank", Sample_Type))
+        
+        #Summarizing data by replicates
+        df_combined_summarized <- df_combined_filtered %>%
+          group_by(Target_Name, SampleName_Concentration) %>% 
+          summarise(
+            mean_Ampere = mean(Average, na.rm = TRUE),
+            st_dev_Ampere = mean(St_dev, na.rm = TRUE),
+            CoVar_Ampere = st_dev_Ampere / mean_Ampere * 100
+          ) %>%
+          ungroup()
+        
+        
+#Summarized dataframe filtering 
+        df_comb_standards_summarized <- df_combined %>%
+          group_by(Target_Name, SampleName_Concentration, Sample_Type) %>% 
+          summarise(
+            mean_Ampere = mean(Average, na.rm = TRUE),
+            st_dev_Ampere = mean(St_dev, na.rm = TRUE),
+            CoVar_Ampere = st_dev_Ampere / mean_Ampere * 100
+          ) %>%
+          ungroup() 
+        
+#------Defining the reactive for the dataframe to download
+        df_combined_reactive(df_combined)
+        df_combined_summarized_reactive(df_comb_standards_summarized)
+        
+        
+        #Defining Mean value for blanks
+        mean_values <- df_combined_summarized %>%
+          filter(SampleName_Concentration == "0") %>%
+          select(Target_Name, mean_Ampere)
+    
+        output$barChart <- renderPlot({
+          p <- ggplot(df_combined_summarized, aes(x=SampleName_Concentration, y=mean_Ampere)) +
+            geom_bar(stat="identity", position=position_dodge()) +
+            geom_errorbar(aes(ymin=mean_Ampere-st_dev_Ampere, ymax=mean_Ampere+st_dev_Ampere), 
+                          width=0.2, position=position_dodge(0.9)) +
+            geom_hline(data=mean_values, aes(yintercept=mean_Ampere, color=Target_Name), linetype="dashed") +
+            scale_y_reverse() +
+            theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 12, colour = "black"),
+                  axis.text.y = element_text(size = 14, colour = "black"),
+                  strip.text = element_text(size = 18, face = "bold"),
+                  axis.title.x = element_text(size = 16, face = "bold"),  
+                  axis.title.y = element_text(size = 16, face = "bold")   
+            ) +
+            labs(title = "Figure 2. Bar chart for each mutation",
+                 x = "Sample Name", y = "Mean Ampere", fill = "Conc. (pM)") +
+            facet_grid(~Target_Name, scales = "free", space = "free") +
+            scale_color_discrete(guide = FALSE) # To hide the legend for colors
+          
+          p
+        }, height = 800)
+  })
+  #Defining downloadable dataframes to UI
+  output$downloadData1 <- downloadHandler(
+    filename = function() {
+      paste('combined_PLACEHOLDERdata-', Sys.Date(), '.csv', sep='')
+    },
+    content = function(file) {
+      write.csv(df_combined_reactive(), file)
+    }
+  )
+  
+  output$downloadData2 <- downloadHandler(
+    filename = function() {
+      paste('summarized_PLACEHOLDERdata-', Sys.Date(), '.csv', sep='')
+    },
+    content = function(file) {
+      write.csv(df_combined_summarized_reactive(), file)
+    }
+  )
+  
+  
+} #Server end syntax
+
+shinyApp(ui = ui, server = server)
+    
+    
+    
+    
+    
+    
+    
